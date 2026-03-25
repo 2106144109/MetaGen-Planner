@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from planner.planner import TaskExecutorPlanner
 from planner.llm_setup import QuickLLMAPI
 from planner.utils import get_workflow_from_api
+from planner.agent_runtime import AgentRuntimeOrchestrator
 
 WORKFLOW_GENERATOR_API_URL = os.getenv("WORKFLOW_GENERATOR_API_URL", "http://localhost:8150/generate_workflow")
 
@@ -40,6 +41,7 @@ MCP_SERVERS = [url for url in MCP_SERVERS if url and url.strip()]
 
 # 仅输出数据传输相关日志
 DATAFLOW_ONLY = os.getenv('DATAFLOW_ONLY', '').strip().lower() in ['1', 'true', 'yes', 'y', 'on']
+USE_AGENT_RUNTIME = os.getenv('USE_AGENT_RUNTIME', '').strip().lower() in ['1', 'true', 'yes', 'y', 'on']
 
 app = FastAPI(
     title="Workflow Executor SSE API",
@@ -134,10 +136,6 @@ async def run_workflow(user_content: str, progress_callback=None) -> str:
                 pass
         await progress_callback(payload)
 
-    # 使用全局executor和其tool_registry
-    llm_api = QuickLLMAPI().api
-    planner = TaskExecutorPlanner(llm_api=llm_api, tool_registry=global_executor.tool_registry, enhanced_executor=global_executor)
-
     workflow = get_workflow_from_api(user_content)
     if not workflow:
         if progress_callback:
@@ -168,7 +166,29 @@ async def run_workflow(user_content: str, progress_callback=None) -> str:
     
     # 支持实时回调
     try:
-        final_report = await planner.execute_workflow(task_input, progress_callback)
+        if USE_AGENT_RUNTIME:
+            runtime = AgentRuntimeOrchestrator(
+                enhanced_executor=global_executor,
+                tool_registry=global_executor.tool_registry,
+                dataflow_only=DATAFLOW_ONLY
+            )
+            if progress_callback:
+                await progress_callback({
+                    "type": "runtime_mode",
+                    "content": "使用 Agent Runtime 模式执行（handoff/guardrail/trace）",
+                    "runtime_mode": "agent_runtime",
+                    "status": "running"
+                })
+            final_report = await runtime.run(user_content, workflow, progress_callback)
+        else:
+            # 使用原有planner路径，保持向后兼容
+            llm_api = QuickLLMAPI().api
+            planner = TaskExecutorPlanner(
+                llm_api=llm_api,
+                tool_registry=global_executor.tool_registry,
+                enhanced_executor=global_executor
+            )
+            final_report = await planner.execute_workflow(task_input, progress_callback)
         
         # 发送完成信息
         if progress_callback:

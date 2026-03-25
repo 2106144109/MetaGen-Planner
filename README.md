@@ -43,6 +43,19 @@ pip install fastapi uvicorn pydantic requests fastmcp PyYAML openai
 * `WORKFLOW_GENERATOR_API_URL`: 工作流生成服务 URL (默认: `http://localhost:8150/generate_workflow`)
 * `SQL_EXECUTOR_URL`: SQL MCP 服务地址 (默认: `http://127.0.0.1:8000/mcp/`)
 * `CHART_SERVER_URL`: 图表 MCP 服务地址 (默认: `http://172.16.1.114:1122/mcp`)
+* `USE_AGENT_RUNTIME`: 是否启用 Agent Runtime 编排模式 (`true/false`，默认关闭)
+* `AGENT_RUNTIME_BACKEND`: Agent Runtime 后端 (`builtin` 或 `openai_agents_sdk`，默认 `builtin`)
+
+## 🧠 Agent Runtime 模式（新）
+
+当 `USE_AGENT_RUNTIME=true` 时，服务将切换到 `AgentRuntimeOrchestrator` 执行链路，提供：
+
+- **handoffs**：manager 自动分配到 `sql_specialist` / `viz_specialist`
+- **guardrails**：输入与动作输出校验
+- **structured output**：`AgentAction` / `TraceEvent` 强类型结构
+- **run hooks + tracing**：内置 trace 事件流和最终报告中 trace 附录
+
+> 说明：若设置 `AGENT_RUNTIME_BACKEND=openai_agents_sdk` 但环境未安装对应 SDK，将自动回退到 `builtin_fallback`。
 
 ## 🚀 快速启动
 

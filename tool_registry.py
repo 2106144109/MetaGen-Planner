@@ -98,6 +98,48 @@ class SqlToolHandler(BaseToolHandler):
 class ChartToolHandler(BaseToolHandler):
     """图表工具处理器 - 支持25种不同类型的图表"""
     
+    def _validate_encoding_fields(self, mcp_args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """校验 encoding 中引用的字段是否在 data 中存在。
+        返回 None 表示通过；返回 dict 表示校验失败并给出可读错误信息。
+        """
+        data = mcp_args.get('data')
+        encoding = mcp_args.get('encoding')
+
+        if not isinstance(data, list) or not data:
+            return None
+        if not isinstance(encoding, dict) or not encoding:
+            return None
+
+        dict_rows = [row for row in data if isinstance(row, dict)]
+        if not dict_rows:
+            return None
+
+        # 使用多行并集字段，避免仅看首行导致误报
+        available_fields_set = set()
+        for row in dict_rows[:50]:
+            available_fields_set.update(row.keys())
+        available_fields = sorted(list(available_fields_set))
+        missing_fields: List[str] = []
+
+        for axis, field_info in encoding.items():
+            if isinstance(field_info, dict):
+                requested_field = field_info.get('field')
+                if isinstance(requested_field, str) and requested_field and requested_field not in available_fields_set:
+                    missing_fields.append(f"{axis}:{requested_field}")
+
+        if not missing_fields:
+            return None
+
+        return {
+            'success': False,
+            'error_type': 'invalid_encoding_fields',
+            'error': '图表encoding字段不存在于数据中',
+            'details': {
+                'missing_fields': missing_fields,
+                'available_fields': available_fields
+            }
+        }
+
     async def execute(self, step_id: str, instruction: str, context: Dict[str, Any], 
                      arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """执行图表任务"""
@@ -137,6 +179,12 @@ class ChartToolHandler(BaseToolHandler):
                             requested_field = field_info['field']
                             print(f"      {axis}: '{requested_field}' ({field_info.get('type', 'unknown')})")
                 print(f"    📤 最终发送给MCP的参数keys: {list(mcp_args.keys())}")
+
+        # Guardrail：图表字段校验，避免把错误字段发送给图表MCP工具
+        validate_error = self._validate_encoding_fields(mcp_args)
+        if validate_error:
+            validate_error['step_id'] = step_id
+            return validate_error
         
         # 通过 MCP 工具执行（强制要求，不再回退本地）
         sql_session = getattr(self.executor_context, 'sql_session', None)
