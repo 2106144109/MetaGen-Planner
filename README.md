@@ -43,6 +43,46 @@ pip install fastapi uvicorn pydantic requests fastmcp PyYAML openai
 * `WORKFLOW_GENERATOR_API_URL`: 工作流生成服务 URL (默认: `http://localhost:8150/generate_workflow`)
 * `SQL_EXECUTOR_URL`: SQL MCP 服务地址 (默认: `http://127.0.0.1:8000/mcp/`)
 * `CHART_SERVER_URL`: 图表 MCP 服务地址 (默认: `http://172.16.1.114:1122/mcp`)
+* `USE_AGENT_RUNTIME`: 是否启用 Agent Runtime 编排模式 (`true/false`，默认关闭)
+* `AGENT_RUNTIME_BACKEND`: Agent Runtime 后端 (`builtin` 或 `openai_agents_sdk`，默认 `builtin`)
+* `MCP_PROTOCOL_VERSION`: MCP 协议协商版本（日期制，默认 `2025-06-18`）
+* `MCP_CONNECT_MAX_RETRIES`: MCP 连接最大重试次数（默认 `3`）
+* `MCP_RETRY_BASE_SECONDS`: MCP 退避重试基准秒数（默认 `0.5`）
+* `MCP_CIRCUIT_FAILURE_THRESHOLD`: 熔断触发失败次数（默认 `3`）
+* `MCP_CIRCUIT_OPEN_SECONDS`: 熔断保持时长（默认 `30` 秒）
+
+## 🧠 Agent Runtime 模式（新）
+
+当 `USE_AGENT_RUNTIME=true` 时，服务将切换到 `AgentRuntimeOrchestrator` 执行链路，提供：
+
+- **handoffs**：manager 自动分配到 `sql_specialist` / `viz_specialist`
+- **guardrails**：输入与动作输出校验
+- **structured output**：`AgentAction` / `TraceEvent` 强类型结构
+- **run hooks + tracing**：内置 trace 事件流和最终报告中 trace 附录
+
+> 说明：若设置 `AGENT_RUNTIME_BACKEND=openai_agents_sdk` 但环境未安装对应 SDK，将自动回退到 `builtin_fallback`。
+
+## 🔌 MCP 路由与健康（升级）
+
+增强执行器现在支持：
+
+- **版本协商记录（日期制）**：在连接阶段记录 `mcp_protocol_version`
+- **能力注册（capability profile）**：缓存每个 server 的 `discovered_tools`、`declared_categories`
+- **策略化路由**：从“端口猜测”升级为“能力声明 + 健康评分”
+- **健康检查 + 熔断 + 退避重试**：连接失败会指数退避，连续失败触发熔断并自动恢复
+
+`GET /health` 将返回 `mcp_profiles`（若执行器已初始化）用于观测。
+
+## 📐 严格结构化输出（新）
+
+核心决策对象已类型化（Pydantic）以减少 JSON 文本解析分支：
+
+- `ToolCall`
+- `NextAction`
+- `StepResult`
+- `FinalReport`
+
+对应定义文件：`agent_types.py`。
 
 ## 🚀 快速启动
 
