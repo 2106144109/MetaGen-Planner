@@ -7,6 +7,7 @@ import json
 import os
 import yaml
 import datetime
+import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -233,6 +234,32 @@ The user will provide the history, concluding with the next instruction to be co
         
         return "\n".join(history_parts)
 
+    def _normalize_tool_call(self, tool_call: Optional[Dict[str, Any]], default_step_id: str) -> Optional[Dict[str, Any]]:
+        """对LLM返回的tool_call做最小化校验和标准化。"""
+        if not isinstance(tool_call, dict):
+            return None
+
+        tool_name = tool_call.get('tool_name')
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return None
+
+        arguments = tool_call.get('arguments')
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        step_id = tool_call.get('step_id')
+        if not isinstance(step_id, str) or not step_id.strip():
+            step_id = default_step_id
+
+        normalized = {
+            'step_id': step_id,
+            'tool_name': tool_name.strip(),
+            'arguments': arguments
+        }
+        if tool_call.get('tool_call_id'):
+            normalized['tool_call_id'] = tool_call.get('tool_call_id')
+        return normalized
+
     def _get_llm_decision(self, query: str, last_post: Post) -> LLMDecision:
         """
         使用YAML模板获取LLM决策（Chat tools 或 MCP responses 或 Chat JSON）
@@ -399,7 +426,7 @@ Please analyze the above context and provide your decision.
                 current_step=next_step_id,
                 step_status='executing' if tool_call else 'unknown',
                 progress_report=progress,
-                tool_call=tool_call
+                tool_call=self._normalize_tool_call(tool_call, next_step_id)
             )
         except (json.JSONDecodeError, KeyError) as e:
             return LLMDecision.from_dict({"response": {"reasoning": "MCP响应解析失败"}})
@@ -548,6 +575,7 @@ Please analyze the above context and provide your decision.
             tool_call_id = (llm_decision.tool_call or {}).get('tool_call_id')
             
             # 使用增强执行器执行所有工具，包括SQL和图表工具
+            step_started_at = time.time()
             if self.enhanced_executor:
                 # 构建执行上下文，包含共享存储
                 context = {
@@ -561,6 +589,9 @@ Please analyze the above context and provide your decision.
             else:
                 # 回退到简化模式（仅支持SQL工具）
                 result_payload = await self._execute_natively(original_step_id, instruction_text, tool_name, arguments)
+            step_elapsed = time.time() - step_started_at
+            if isinstance(result_payload, dict):
+                result_payload['execution_time'] = step_elapsed
 
             # 将工具结果回传给 LLM（role:"tool"），促使其给出总结/下一步（仅当存在 tool_call_id 时）
             followup_result = None
@@ -650,7 +681,8 @@ Please analyze the above context and provide your decision.
                         "used_tool": used_tool,
                         "task_type": result_data.get('task_type') if isinstance(result_data, dict) else None,
                         "function": used_tool,
-                        "llm_summary": llm_summary
+                        "llm_summary": llm_summary,
+                        "execution_time": result_data.get('execution_time') if isinstance(result_data, dict) else None
                     })
             else:
                 if progress_callback:
@@ -667,7 +699,8 @@ Please analyze the above context and provide your decision.
                         "used_tool": used_tool,
                         "task_type": result_data.get('task_type') if isinstance(result_data, dict) else None,
                         "function": used_tool,
-                        "llm_summary": llm_summary
+                        "llm_summary": llm_summary,
+                        "execution_time": result_data.get('execution_time') if isinstance(result_data, dict) else None
                     })
 
             current_post = executor_feedback_post
@@ -1100,4 +1133,3 @@ Please analyze the above context and provide your decision.
             f"### 执行记忆（机读）\n"
             f"```json\n{json_tail}\n```"
         )
-
