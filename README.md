@@ -57,6 +57,17 @@ pip install fastapi uvicorn pydantic requests fastmcp PyYAML openai
 
 > 说明：若设置 `AGENT_RUNTIME_BACKEND=openai_agents_sdk` 但环境未安装对应 SDK，将自动回退到 `builtin_fallback`。
 
+## 📐 严格结构化输出（新）
+
+核心决策对象已类型化（Pydantic）以减少 JSON 文本解析分支：
+
+- `ToolCall`
+- `NextAction`
+- `StepResult`
+- `FinalReport`
+
+对应定义文件：`agent_types.py`。
+
 ## 🚀 快速启动
 
 ### 1. 启动 Web 服务 (FastAPI + SSE)
