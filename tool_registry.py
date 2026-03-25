@@ -110,17 +110,21 @@ class ChartToolHandler(BaseToolHandler):
         if not isinstance(encoding, dict) or not encoding:
             return None
 
-        first_row = data[0] if isinstance(data[0], dict) else None
-        if not isinstance(first_row, dict):
+        dict_rows = [row for row in data if isinstance(row, dict)]
+        if not dict_rows:
             return None
 
-        available_fields = list(first_row.keys())
+        # 使用多行并集字段，避免仅看首行导致误报
+        available_fields_set = set()
+        for row in dict_rows[:50]:
+            available_fields_set.update(row.keys())
+        available_fields = sorted(list(available_fields_set))
         missing_fields: List[str] = []
 
         for axis, field_info in encoding.items():
             if isinstance(field_info, dict):
                 requested_field = field_info.get('field')
-                if isinstance(requested_field, str) and requested_field and requested_field not in first_row:
+                if isinstance(requested_field, str) and requested_field and requested_field not in available_fields_set:
                     missing_fields.append(f"{axis}:{requested_field}")
 
         if not missing_fields:
