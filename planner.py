@@ -5,6 +5,7 @@
 # ==========================================================
 import json
 import os
+import re
 import yaml
 import datetime
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 
 # 引入 llm_setup 模块
 from .llm_setup import QuickLLMAPI, BaseLLMBackend
+from .agent_types import ToolCall, NextAction, StepResult, FinalReport
 # 引入工具注册表
 
 # (数据类定义保持不变)
@@ -251,14 +253,86 @@ The user will provide the history, concluding with the next instruction to be co
         if not isinstance(step_id, str) or not step_id.strip():
             step_id = default_step_id
 
-        normalized = {
+        payload = {
             'step_id': step_id,
             'tool_name': tool_name.strip(),
-            'arguments': arguments
+            'arguments': arguments,
+            'tool_call_id': tool_call.get('tool_call_id')
         }
-        if tool_call.get('tool_call_id'):
-            normalized['tool_call_id'] = tool_call.get('tool_call_id')
-        return normalized
+        try:
+            return ToolCall.model_validate(payload).model_dump(exclude_none=True)
+        except Exception:
+            return None
+
+    def _safe_json_loads(self, text: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(text, str):
+            return None
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _extract_tool_call_from_content(self, content: str, next_step_id: str) -> Dict[str, Any]:
+        """从message.content中提取 tool_call。
+        支持 ```json fenced``` 以及裸 JSON 两种格式。
+        """
+        result = {'reasoning': 'MCP工具调用', 'tool_call': None}
+        if not isinstance(content, str) or not content.strip():
+            return result
+
+        candidates: List[str] = []
+        json_match = re.search(r'```json\s*\n(.*?)\n```', content, re.DOTALL)
+        if json_match:
+            candidates.append(json_match.group(1).strip())
+        if content.strip().startswith('{'):
+            candidates.append(content.strip())
+
+        for candidate in candidates:
+            content_data = self._safe_json_loads(candidate)
+            if not content_data:
+                continue
+            response_data = content_data.get('response', {}) if isinstance(content_data, dict) else {}
+            if isinstance(response_data, dict):
+                reasoning = response_data.get('reasoning')
+                if isinstance(reasoning, str) and reasoning.strip():
+                    result['reasoning'] = reasoning
+                normalized = self._normalize_tool_call(response_data.get('tool_call'), next_step_id)
+                if normalized:
+                    result['tool_call'] = normalized
+                    return result
+        return result
+
+    def _extract_tool_call_from_message(self, msg: Dict[str, Any], next_step_id: str) -> Dict[str, Any]:
+        """统一从 Chat Completions message 提取 reasoning / tool_call。"""
+        result = {'reasoning': 'MCP工具调用', 'tool_call': None, 'assistant_tool_call': None}
+        if not isinstance(msg, dict):
+            return result
+
+        # 优先使用 tool_calls（函数调用）
+        tool_calls = msg.get('tool_calls') or []
+        if tool_calls:
+            tc = tool_calls[0]
+            name = (tc.get('function') or {}).get('name')
+            args_text = (tc.get('function') or {}).get('arguments') or '{}'
+            args = self._safe_json_loads(args_text)
+            normalized = self._normalize_tool_call({
+                'step_id': next_step_id,
+                'tool_name': name,
+                'arguments': args if isinstance(args, dict) else {},
+                'tool_call_id': tc.get('id')
+            }, next_step_id)
+            result['tool_call'] = normalized
+            result['assistant_tool_call'] = tc
+            if isinstance(msg.get('content'), str) and msg.get('content').strip():
+                result['reasoning'] = msg.get('content')
+            return result
+
+        # 退回解析 content JSON
+        content_result = self._extract_tool_call_from_content(msg.get('content', ''), next_step_id)
+        result['reasoning'] = content_result.get('reasoning', result['reasoning'])
+        result['tool_call'] = content_result.get('tool_call')
+        return result
 
     def _get_llm_decision(self, query: str, last_post: Post) -> LLMDecision:
         """
@@ -341,92 +415,31 @@ Please analyze the above context and provide your decision.
             choice0 = (parsed.get('choices') or [{}])[0]
             msg = choice0.get('message') or {}
             
-            tool_call = None
-            reasoning = 'MCP工具调用'
-            
-            # 优先检查 OpenAI function calling 格式
-            tool_calls = msg.get('tool_calls') or []
-            if tool_calls:
-                tc = tool_calls[0]
-                name = (tc.get('function') or {}).get('name')
-                args_text = (tc.get('function') or {}).get('arguments') or '{}'
-                try:
-                    args = json.loads(args_text)
-                except Exception:
-                    args = { 'raw': args_text }
-                
-                tool_call = {
-                    'step_id': next_step_id,
-                    'tool_name': name,
-                    'arguments': args,
-                    'tool_call_id': tc.get('id')
-                }
-                reasoning = msg.get('content') or reasoning
-                
-                # 缓存 chat tools 上下文，便于执行后回传 role:"tool"
+            parsed_decision = self._extract_tool_call_from_message(msg, next_step_id)
+            normalized_tool_call = parsed_decision.get('tool_call')
+            reasoning = parsed_decision.get('reasoning', 'MCP工具调用')
+
+            # 缓存 chat tools 上下文，便于执行后回传 role:"tool"
+            if parsed_decision.get('assistant_tool_call'):
                 self._chat_tools_ctx = {
                     'user_prompt': final_prompt,
-                    'assistant_tool_call': tc,
+                    'assistant_tool_call': parsed_decision.get('assistant_tool_call'),
                     'tools_spec': tools_spec
                 }
-            
-            # 当 tool_calls 为空时，尝试从 message.content 解析 JSON
-            else:
-                content = msg.get('content', '')
-                
-                if content:
-                    # 方法1: 提取 ```json ... ``` 格式
-                    import re
-                    json_match = re.search(r'```json\s*\n(.*?)\n```', content, re.DOTALL)
-                    
-                    if json_match:
-                        try:
-                            json_content = json_match.group(1).strip()
-                            content_data = json.loads(json_content)
-                            response_data = content_data.get('response', {})
-                            tool_call_data = response_data.get('tool_call')
-                            reasoning = response_data.get('reasoning', reasoning)
-                            
-                            if tool_call_data and isinstance(tool_call_data, dict):
-                                # 验证必需字段
-                                if tool_call_data.get('tool_name'):
-                                    tool_call = {
-                                        'step_id': tool_call_data.get('step_id', next_step_id),
-                                        'tool_name': tool_call_data.get('tool_name'),
-                                        'arguments': tool_call_data.get('arguments', {}),
-                                        'tool_call_id': None  # 文本格式没有call_id
-                                    }
-                                    
-                        except (json.JSONDecodeError, KeyError) as e:
-                            pass
-                    
-                    # 方法2: 尝试直接解析整个 content 作为 JSON (备用方案)
-                    elif content.strip().startswith('{'):
-                        try:
-                            
-                            content_data = json.loads(content.strip())
-                            response_data = content_data.get('response', {})
-                            tool_call_data = response_data.get('tool_call')
-                            reasoning = response_data.get('reasoning', reasoning)
-                            
-                            if tool_call_data and isinstance(tool_call_data, dict) and tool_call_data.get('tool_name'):
-                                tool_call = {
-                                    'step_id': tool_call_data.get('step_id', next_step_id),
-                                    'tool_name': tool_call_data.get('tool_name'),
-                                    'arguments': tool_call_data.get('arguments', {}),
-                                    'tool_call_id': None
-                                }
-                                
-                                    
-                        except (json.JSONDecodeError, KeyError) as e:
-                            pass
-            
-            return LLMDecision(
+
+            next_action = NextAction(
                 reasoning=reasoning,
                 current_step=next_step_id,
-                step_status='executing' if tool_call else 'unknown',
+                step_status='executing' if normalized_tool_call else 'unknown',
                 progress_report=progress,
-                tool_call=self._normalize_tool_call(tool_call, next_step_id)
+                tool_call=normalized_tool_call
+            )
+            return LLMDecision(
+                reasoning=next_action.reasoning,
+                current_step=next_action.current_step,
+                step_status=next_action.step_status,
+                progress_report=next_action.progress_report,
+                tool_call=next_action.tool_call.model_dump(exclude_none=True) if next_action.tool_call else None
             )
         except (json.JSONDecodeError, KeyError) as e:
             return LLMDecision.from_dict({"response": {"reasoning": "MCP响应解析失败"}})
@@ -664,6 +677,21 @@ Please analyze the above context and provide your decision.
 
             # 如果步骤成功完成，更新进度
             result_data = executor_feedback_post.attachments.get('result', {})
+            step_result_model = None
+            if isinstance(result_data, dict):
+                try:
+                    step_result_model = StepResult.model_validate({
+                        "step_id": original_step_id,
+                        "success": bool(result_data.get('success', False)),
+                        "task_type": result_data.get('task_type', 'unknown'),
+                        "used_tool": result_data.get('used_tool'),
+                        "execution_time": result_data.get('execution_time'),
+                        "error": result_data.get('error'),
+                        "data": result_data.get('data'),
+                        "llm_summary": result_data.get('llm_summary')
+                    })
+                except Exception:
+                    step_result_model = None
             if result_data.get('success', False):
                 completed_steps += 1
                 if progress_callback:
@@ -675,7 +703,7 @@ Please analyze the above context and provide your decision.
                         "step_number": current_step_number,
                         "total_steps": total_steps,
                         "message": f"步骤 {current_step_number} 完成",
-                        "result": result_data,
+                        "result": step_result_model.model_dump(exclude_none=True) if step_result_model else result_data,
                         "completed_steps": completed_steps,
                         "status": "completed",
                         "used_tool": used_tool,
@@ -700,7 +728,8 @@ Please analyze the above context and provide your decision.
                         "task_type": result_data.get('task_type') if isinstance(result_data, dict) else None,
                         "function": used_tool,
                         "llm_summary": llm_summary,
-                        "execution_time": result_data.get('execution_time') if isinstance(result_data, dict) else None
+                        "execution_time": result_data.get('execution_time') if isinstance(result_data, dict) else None,
+                        "result": step_result_model.model_dump(exclude_none=True) if step_result_model else result_data
                     })
 
             current_post = executor_feedback_post
@@ -1123,7 +1152,36 @@ Please analyze the above context and provide your decision.
 
         json_tail = json.dumps({"memory": memory_data}, ensure_ascii=False, indent=2)
 
-        # 返回：人类摘要 + 步骤摘要 + 共享存储键摘要 + 详细共享存储（代码块）+ 机读记忆（代码块）
+        # 结构化最终报告（强类型）
+        structured_step_results: List[StepResult] = []
+        for step_id in sorted(self.memory.initial_plan.keys(), key=_step_order):
+            rec = self.memory.step_records.get(step_id)
+            step_status = rec.status if rec else self.memory.step_status.get(step_id, "pending")
+            structured_step_results.append(
+                StepResult(
+                    step_id=step_id,
+                    success=step_status in ["completed", "skipped"],
+                    task_type=(
+                        rec.structured_content.get("task_type", "unknown")
+                        if rec and isinstance(rec.structured_content, dict) else "unknown"
+                    ),
+                    data=(rec.structured_content if rec else None),
+                    error=None if step_status in ["completed", "skipped"] else "step_failed"
+                )
+            )
+
+        final_report_obj = FinalReport(
+            query=query,
+            total_steps=len(self.memory.initial_plan),
+            completed_steps=progress.get('completed_steps', []),
+            failed_steps=progress.get('failed_steps', []),
+            shared_storage_keys=list(self.memory.shared_storage.keys()),
+            step_results=structured_step_results,
+            summary=f"completed={len(progress.get('completed_steps', []))}, failed={len(progress.get('failed_steps', []))}"
+        )
+        final_report_json = json.dumps(final_report_obj.model_dump(), ensure_ascii=False, indent=2)
+
+        # 返回：人类摘要 + 步骤摘要 + 共享存储键摘要 + 详细共享存储（代码块）+ 结构化最终报告
         return (
             f"{report}\n\n"
             f"{step_summaries_md}\n\n"
@@ -1131,5 +1189,7 @@ Please analyze the above context and provide your decision.
             f"### 共享存储详细内容\n"
             f"```json\n{shared_storage_json}\n```\n\n"
             f"### 执行记忆（机读）\n"
-            f"```json\n{json_tail}\n```"
+            f"```json\n{json_tail}\n```\n\n"
+            f"### 最终报告（结构化）\n"
+            f"```json\n{final_report_json}\n```"
         )

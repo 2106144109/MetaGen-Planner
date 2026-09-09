@@ -5,8 +5,25 @@
 
 from fastmcp import Client
 from typing import Dict, Any, Optional, List
+from dataclasses import dataclass, field
+import os
+import asyncio
+import time
 
 from .tool_registry import ToolRegistry
+
+
+@dataclass
+class ServerCapabilityProfile:
+    server_url: str
+    mcp_protocol_version: str = "unknown"
+    discovered_tools: List[str] = field(default_factory=list)
+    declared_categories: List[str] = field(default_factory=list)
+    health_score: float = 1.0
+    consecutive_failures: int = 0
+    circuit_open_until: float = 0.0
+    last_error: Optional[str] = None
+    last_checked_at: float = 0.0
 
 
 class EnhancedMcpExecutor:
@@ -21,11 +38,73 @@ class EnhancedMcpExecutor:
         """
         self.mcp_servers = mcp_servers
         self.mcp_sessions: Dict[str, Client] = {}
+        self.server_profiles: Dict[str, ServerCapabilityProfile] = {}
         
         # 动态工具注册表，完全从MCP服务器获取工具信息
         self.tool_registry = ToolRegistry()
         self.is_connected = False
-        
+        self.max_connect_retries = int(os.getenv("MCP_CONNECT_MAX_RETRIES", "3"))
+        self.retry_base_seconds = float(os.getenv("MCP_RETRY_BASE_SECONDS", "0.5"))
+        self.circuit_failure_threshold = int(os.getenv("MCP_CIRCUIT_FAILURE_THRESHOLD", "3"))
+        self.circuit_open_seconds = float(os.getenv("MCP_CIRCUIT_OPEN_SECONDS", "30"))
+        # MCP 协议版本（日期制）
+        self.expected_mcp_version = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18")
+
+    def _infer_categories_from_tools(self, tool_names: List[str]) -> List[str]:
+        categories = set()
+        for name in tool_names:
+            low = (name or "").lower()
+            if "sql" in low:
+                categories.add("sql")
+            if any(x in low for x in ["chart", "plot", "bar", "line", "pie", "histogram", "scatter"]):
+                categories.add("chart")
+            if "file" in low:
+                categories.add("file")
+            if "web" in low:
+                categories.add("web")
+        return sorted(list(categories))
+
+    async def _probe_server_profile(self, server_url: str, session) -> ServerCapabilityProfile:
+        tools = await session.list_tools()
+        tool_names: List[str] = []
+        for t in tools or []:
+            tool_names.append(getattr(t, "name", str(t)))
+
+        categories = self._infer_categories_from_tools(tool_names)
+        profile = self.server_profiles.get(server_url) or ServerCapabilityProfile(server_url=server_url)
+        profile.discovered_tools = tool_names
+        profile.declared_categories = categories
+        profile.last_checked_at = time.time()
+        profile.last_error = None
+        # 协议协商（日期制）：当前 fastmcp 客户端未暴露明确字段时，记录期望版本作为会话协商版本
+        profile.mcp_protocol_version = self.expected_mcp_version
+        self.server_profiles[server_url] = profile
+        return profile
+
+    def _mark_server_failure(self, server_url: str, error: str):
+        profile = self.server_profiles.get(server_url) or ServerCapabilityProfile(server_url=server_url)
+        profile.consecutive_failures += 1
+        profile.last_error = error
+        profile.health_score = max(0.05, profile.health_score * 0.7)
+        if profile.consecutive_failures >= self.circuit_failure_threshold:
+            profile.circuit_open_until = time.time() + self.circuit_open_seconds
+        self.server_profiles[server_url] = profile
+
+    def _mark_server_success(self, server_url: str):
+        profile = self.server_profiles.get(server_url) or ServerCapabilityProfile(server_url=server_url)
+        profile.consecutive_failures = 0
+        profile.circuit_open_until = 0.0
+        profile.last_error = None
+        profile.health_score = min(1.0, profile.health_score + 0.1)
+        profile.last_checked_at = time.time()
+        self.server_profiles[server_url] = profile
+
+    def _is_circuit_open(self, server_url: str) -> bool:
+        profile = self.server_profiles.get(server_url)
+        if not profile:
+            return False
+        return profile.circuit_open_until > time.time()
+    
     async def connect(self) -> bool:
         """连接所有MCP服务器并发现工具"""
         if self.is_connected:
@@ -37,23 +116,32 @@ class EnhancedMcpExecutor:
         connected_servers = 0
         
         for server_url in self.mcp_servers:
-            try:
-                print(f"  📡 正在连接服务器: {server_url}")
-                
-                # 1. 创建MCP客户端
-                client = Client(server_url)
-                self.mcp_sessions[server_url] = client
-                
-                # 2. 测试连接并动态注册工具
-                async with client as session:
-                    discovered_count = await self.tool_registry.register_from_mcp_server(session)
-                    total_discovered += discovered_count
-                    print(f"  ✅ 服务器 {server_url} 连接成功，发现 {discovered_count} 个工具")
-                    connected_servers += 1
-                    
-            except Exception as e:
-                print(f"  ❌ 服务器 {server_url} 连接失败: {e}")
-                continue
+            print(f"  📡 正在连接服务器: {server_url}")
+            connected = False
+            for attempt in range(1, self.max_connect_retries + 1):
+                try:
+                    client = Client(server_url)
+                    self.mcp_sessions[server_url] = client
+                    async with client as session:
+                        profile = await self._probe_server_profile(server_url, session)
+                        discovered_count = await self.tool_registry.register_from_mcp_server(session)
+                        total_discovered += discovered_count
+                        connected_servers += 1
+                        connected = True
+                        self._mark_server_success(server_url)
+                        print(
+                            f"  ✅ 服务器 {server_url} 连接成功，发现 {discovered_count} 个工具，"
+                            f"categories={profile.declared_categories}, mcp_version={profile.mcp_protocol_version}"
+                        )
+                    break
+                except Exception as e:
+                    self._mark_server_failure(server_url, str(e))
+                    wait_seconds = self.retry_base_seconds * (2 ** (attempt - 1))
+                    print(f"  ⚠️ 服务器 {server_url} 连接失败 (attempt {attempt}/{self.max_connect_retries}): {e}")
+                    if attempt < self.max_connect_retries:
+                        await asyncio.sleep(wait_seconds)
+            if not connected:
+                print(f"  ❌ 服务器 {server_url} 最终连接失败，已跳过")
         
         if connected_servers == 0:
             print("❌ [MCP Executor] 所有MCP服务器连接失败，启用fallback模式")
@@ -153,8 +241,12 @@ class EnhancedMcpExecutor:
                     result = await handler.execute(step_id, instruction, context, arguments)
                     if isinstance(result, dict) and 'success' in result and not result.get('success'):
                         print(f"  ❌ [MCP Executor] 工具执行失败: {result.get('error', 'N/A')}")
+                        self._mark_server_failure(server_url, str(result.get('error', 'tool_failed')))
+                    else:
+                        self._mark_server_success(server_url)
                 except Exception as handler_error:
                     print(f"  ❌ [MCP Executor] Handler执行异常: {handler_error}")
+                    self._mark_server_failure(server_url, str(handler_error))
                     raise
                 finally:
                     # 恢复原来的session
@@ -213,36 +305,51 @@ class EnhancedMcpExecutor:
         return None
     
     def _select_mcp_server_url(self, tool_name: str) -> str:
-        """根据工具选择合适的MCP服务器URL"""
+        """根据工具能力 + 健康评分 + 熔断状态选择MCP服务器URL"""
         if not self.mcp_sessions:
             raise RuntimeError("没有可用的MCP连接")
         
         tool_def = self.tool_registry.tools.get(tool_name)
-        if tool_def:
-            # 如果是图表工具，选择图表服务器（1122端口）
-            if tool_def.category == 'chart':
-                for server_url in self.mcp_sessions.keys():
-                    # 图表服务器特征：端口1122或URL包含chart
-                    if ':1122' in server_url or 'chart' in server_url.lower():
-                        print(f"  🎯 [MCP Executor] 选择图表服务器: {server_url}")
-                        return server_url
-                # 如果没找到专用图表服务器，选择非SQL服务器
-                for server_url in self.mcp_sessions.keys():
-                    if ':8000' not in server_url and 'sql' not in server_url.lower():
-                        print(f"  🎯 [MCP Executor] 选择非SQL服务器作为图表服务器: {server_url}")
-                        return server_url
-            # 如果是SQL工具，选择SQL服务器（8000端口）
-            elif tool_def.category == 'sql':
-                for server_url in self.mcp_sessions.keys():
-                    # SQL服务器特征：端口8000或URL包含sql
-                    if ':8000' in server_url or 'sql' in server_url.lower():
-                        print(f"  🎯 [MCP Executor] 选择SQL服务器: {server_url}")
-                        return server_url
-        
-        # 默认返回第一个可用的服务器URL
-        default_url = list(self.mcp_sessions.keys())[0]
-        print(f"     使用默认服务器: {default_url}")
-        return default_url
+        desired_category = tool_def.category if tool_def else None
+        candidate_scores: List[tuple[float, str]] = []
+
+        for server_url in self.mcp_sessions.keys():
+            if self._is_circuit_open(server_url):
+                continue
+
+            profile = self.server_profiles.get(server_url)
+            health = profile.health_score if profile else 0.5
+            capability_bonus = 0.0
+            if desired_category and profile and desired_category in profile.declared_categories:
+                capability_bonus += 1.0
+            # 兼容未声明能力时的弱启发式
+            if desired_category == "chart" and (":1122" in server_url or "chart" in server_url.lower()):
+                capability_bonus += 0.3
+            if desired_category == "sql" and (":8000" in server_url or "sql" in server_url.lower()):
+                capability_bonus += 0.3
+            score = health + capability_bonus
+            candidate_scores.append((score, server_url))
+
+        if not candidate_scores:
+            # 若全部熔断，选择最早恢复的一个，避免彻底不可用
+            if self.server_profiles:
+                fallback_url = min(
+                    self.server_profiles.keys(),
+                    key=lambda url: self.server_profiles[url].circuit_open_until or 0.0
+                )
+                print(f"  ⚠️ [MCP Executor] 所有节点熔断，使用最早恢复节点: {fallback_url}")
+                return fallback_url
+            return list(self.mcp_sessions.keys())[0]
+
+        candidate_scores.sort(key=lambda x: x[0], reverse=True)
+        selected_score, selected_url = candidate_scores[0]
+        profile = self.server_profiles.get(selected_url)
+        print(
+            f"  🎯 [MCP Executor] 选择服务器: {selected_url} "
+            f"(score={selected_score:.2f}, health={profile.health_score if profile else 0.5:.2f}, "
+            f"categories={profile.declared_categories if profile else []})"
+        )
+        return selected_url
     
     def _select_mcp_session(self, tool_name: str) -> Client:
         """根据工具选择合适的MCP session (已弃用，保留兼容性)"""
@@ -322,5 +429,27 @@ class EnhancedMcpExecutor:
         
         if self.mcp_sessions:
             print(f"📋 [MCP Executor] 已连接 {len(self.mcp_sessions)} 个服务器，共 {len(enabled_tools)} 个工具就绪")
+            for server_url, profile in self.server_profiles.items():
+                print(
+                    f"   - {server_url} | version={profile.mcp_protocol_version} "
+                    f"| categories={profile.declared_categories} | health={profile.health_score:.2f} "
+                    f"| failures={profile.consecutive_failures}"
+                )
         else:
             print(f"📋 [MCP Executor] Fallback模式，共 {len(enabled_tools)} 个工具就绪")
+
+    def get_server_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """导出MCP服务器能力/健康画像，便于上层观测。"""
+        result: Dict[str, Dict[str, Any]] = {}
+        for url, profile in self.server_profiles.items():
+            result[url] = {
+                "mcp_protocol_version": profile.mcp_protocol_version,
+                "declared_categories": profile.declared_categories,
+                "discovered_tools": profile.discovered_tools,
+                "health_score": profile.health_score,
+                "consecutive_failures": profile.consecutive_failures,
+                "circuit_open_until": profile.circuit_open_until,
+                "last_error": profile.last_error,
+                "last_checked_at": profile.last_checked_at
+            }
+        return result
