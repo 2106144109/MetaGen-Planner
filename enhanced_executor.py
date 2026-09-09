@@ -7,6 +7,7 @@ from fastmcp import Client
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 import os
+import asyncio
 import time
 
 from .tool_registry import ToolRegistry
@@ -138,7 +139,7 @@ class EnhancedMcpExecutor:
                     wait_seconds = self.retry_base_seconds * (2 ** (attempt - 1))
                     print(f"  ⚠️ 服务器 {server_url} 连接失败 (attempt {attempt}/{self.max_connect_retries}): {e}")
                     if attempt < self.max_connect_retries:
-                        time.sleep(wait_seconds)
+                        await asyncio.sleep(wait_seconds)
             if not connected:
                 print(f"  ❌ 服务器 {server_url} 最终连接失败，已跳过")
         

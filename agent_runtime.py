@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import importlib
+import re
 from typing import Dict, Any, Optional, List, Callable, Awaitable
 
 from pydantic import BaseModel, Field
@@ -80,6 +81,29 @@ class AgentRuntimeOrchestrator:
             return "viz_specialist"
         return "sql_specialist"
 
+    def _chart_tool_for_instruction(self, instruction: str) -> str:
+        """Preserve explicit tool names and common English/Chinese chart requests."""
+        text = instruction.lower()
+        explicit_tool = re.search(r"\bgenerate_[a-z_]+_(?:chart|plot)\b", text)
+        if explicit_tool:
+            return explicit_tool.group(0)
+        aliases = {
+            "line": ("line", "折线", "曲线"),
+            "pie": ("pie", "饼图", "饼状"),
+            "scatter": ("scatter", "散点"),
+            "bar": ("bar", "条形", "条状"),
+            "column": ("column", "柱状", "柱形"),
+            "area": ("area", "面积图"),
+            "histogram": ("histogram", "直方图"),
+            "radar": ("radar", "雷达图"),
+        }
+        for chart_type, names in aliases.items():
+            for name in names:
+                pattern = rf"\b{re.escape(name)}\b" if name.isascii() else re.escape(name)
+                if re.search(pattern, text):
+                    return f"generate_{chart_type}_chart"
+        return "generate_column_chart"
+
     def _build_action(self, step_id: str, instruction: str, specialist: str, shared_storage: Dict[str, Any]) -> AgentAction:
         if specialist == "viz_specialist":
             prev_step = None
@@ -87,7 +111,7 @@ class AgentRuntimeOrchestrator:
                 if key.endswith("_result"):
                     prev_step = key[:-7]
                     break
-            tool_name = "generate_column_chart"
+            tool_name = self._chart_tool_for_instruction(instruction)
             arguments: Dict[str, Any] = {"title": f"{step_id} 可视化结果"}
             if prev_step:
                 arguments["data_from_step"] = prev_step
